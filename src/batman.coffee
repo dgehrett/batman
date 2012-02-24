@@ -2466,7 +2466,6 @@ class Batman.Controller extends Batman.Object
       view.on 'ready', =>
         Batman.DOM.Yield.withName(into).replace view.get('node')
         Batman.currentApp?.allowAndFire 'ready'
-        view.ready?(@params)
     view
 
 # Models
