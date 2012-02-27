@@ -2301,7 +2301,7 @@ class Batman.App extends Batman.Object
     @
 
 class Batman.RenderCache extends Batman.Hash
-  maximumLength: 10
+  maximumLength: 4
   constructor: ->
     super
     @keyQueue = []
@@ -3792,13 +3792,12 @@ class Batman.View extends Batman.Object
         html = @get('html')
         return unless html && html.length > 0
         @node = document.createElement 'div'
+        @_setNodeOwner(@node)
         $setInnerHTML(@node, html)
-        if @node.children.length > 0
-          Batman.data(@node.children[0], 'view', @)
       return @node
     set: (_, node) ->
       @node = node
-      Batman.data(@node, 'view', @)
+      @_setNodeOwner(node)
       updateHTML = (html) =>
         if html?
           $setInnerHTML(@get('node'), html)
@@ -3846,7 +3845,6 @@ class Batman.View extends Batman.Object
     if node
       @_renderer = new Batman.Renderer(node, null, @context, @)
       @_renderer.on 'rendered', =>
-        @applyYields()
         @fire('ready', node)
 
   applyYields: ->
@@ -3858,6 +3856,8 @@ class Batman.View extends Batman.Object
   retractYields: ->
     @get('yields').forEach (name, nodes) ->
       node.parentNode?.removeChild(node) for {node} in nodes
+
+  _setNodeOwner: (node) -> Batman._data(node, 'view', @)
 
   @::on 'appear', -> @viewDidAppear? arguments...
   @::on 'disappear', -> @viewDidDisappear? arguments...
@@ -4122,7 +4122,9 @@ Batman.DOM = {
       $onParseExit node, -> Batman.DOM.Yield.withName(key).set 'destinationNode', node
       true
     contentfor: (node, key, context, renderer, action = 'append') ->
-      $onParseExit node, -> renderer.view.get("yields.#{key}").push({node, action})
+      $onParseExit node, ->
+        node.parentNode?.removeChild(node)
+        renderer.view.get("yields.#{key}").push({node, action})
       true
     replace:    (node, key, context, renderer) ->
       Batman.DOM.readers.contentfor(node, key, context, renderer, 'replace')
@@ -4180,7 +4182,7 @@ Batman.DOM = {
       [_, parent] = context.findKey contextKey
       view = null
       parent.observeAndFire contextKey, (newValue) ->
-        view ||= Batman.data node, 'view'
+        view ||= Batman._data node, 'view'
         view?.set bindKey, newValue
   }
 
@@ -4247,6 +4249,8 @@ Batman.DOM = {
 
   Yield: class Yield extends Batman.Object
     @yields: {}
+
+    # Helper function for queueing any invocations until the destinationNode property is present
     @queued: (fn) ->
       return (args...) ->
         if @destinationNode?
@@ -4256,19 +4260,14 @@ Batman.DOM = {
             result = fn.apply(@, args)
             @forget 'destinationNode', handler
             result
-    @detachQueued = (fn) ->
-      queuer = @queued(fn)
-      return (node) ->
-        node?.parentNode?.removeChild(node)
-        queuer.apply(@, arguments)
     @clearAll: -> @yields = {}
     @withName: (name) ->
       @yields[name] ||= new @({name})
       @yields[name]
 
     clear:   @queued -> $setInnerHTML @destinationNode, '', true
-    append:  @detachQueued (node) -> $appendChild @destinationNode, node, true
-    replace: @detachQueued (node) -> @clear(); @append(node)
+    append:  @queued (node) -> $appendChild @destinationNode, node, true
+    replace: @queued (node) -> @clear(); @append(node)
 
   partial: (container, path, context, renderer) ->
     renderer.prevent 'rendered'
@@ -4372,25 +4371,26 @@ Batman.DOM = {
       bindings.add binding
     else
       Batman._data node, 'bindings', new Batman.SimpleSet(binding)
-
     Batman.DOM.fire('bindingAdded', binding)
     true
 
   willInsertNode: (node) ->
-    view = Batman.data node, 'view'
+    view = Batman._data node, 'view'
     view?.fire 'beforeAppear', node
     Batman.data(node, 'show')?.call(node)
     Batman.DOM.willInsertNode(child) for child in node.childNodes
     true
 
   didInsertNode: (node) ->
-    view = Batman.data node, 'view'
-    view?.fire 'appear', node
+    view = Batman._data node, 'view'
+    if view
+      view.fire 'appear', node
+      view.applyYields()
     Batman.DOM.didInsertNode(child) for child in node.childNodes
     true
 
   willRemoveNode: (node) ->
-    view = Batman.data node, 'view'
+    view = Batman._data node, 'view'
     if view
       view.fire 'beforeDisappear', node
     Batman.data(node, 'hide')?.call(node)
@@ -4398,7 +4398,7 @@ Batman.DOM = {
     true
 
   didRemoveNode: (node) ->
-    view = Batman.data node, 'view'
+    view = Batman._data node, 'view'
     if view && view.get('cached')
       view.retractYields()
       view.fire 'disappear', node
@@ -4417,7 +4417,7 @@ Batman.DOM = {
       Batman.removeData node                   # external data (Batman.data)
       Batman.removeData node, undefined, true  # internal data (Batman._data)
 
-    Batman.DOM.didRemoveNode(child) for child in node.childNodes
+      Batman.DOM.didRemoveNode(child) for child in node.childNodes
     true
 
 }
@@ -4681,7 +4681,7 @@ class Batman.DOM.ShowHideBinding extends Batman.DOM.AbstractBinding
     super
 
   dataChange: (value) ->
-    view = Batman.data @node, 'view'
+    view = Batman._data @node, 'view'
     if !!value is not @invert
       view?.fire 'beforeAppear', @node
 
@@ -5001,13 +5001,10 @@ class Batman.DOM.ViewBinding extends Batman.DOM.AbstractBinding
         context: @renderContext
         parentView: @renderContext.findKey('isView')?[1]
 
-    Batman.data @node, 'view', @view
-
     @view.on 'ready', =>
-      @view.awakeFromHTML? @node
-      @view.fire 'beforeAppear', @node
+      Batman.DOM.willInsertNode(@node)
       @renderer.allowAndFire 'rendered'
-      @view.fire 'appear', @node
+      Batman.DOM.didInsertNode(@node)
 
     @die()
 
@@ -5173,10 +5170,7 @@ class Batman.DOM.IteratorBinding extends Batman.DOM.AbstractCollectionBinding
     oldNode = @nodeMap.unset(item)
     @cancelExistingItem(item)
     if oldNode
-      if hideFunction = Batman.data oldNode, 'hide'
-        hideFunction.call(oldNode)
-      else
-        $removeNode(oldNode)
+      $removeNode(oldNode)
 
   removeAll: -> @nodeMap.forEach (item) => @removeItem(item)
 
@@ -5199,14 +5193,10 @@ class Batman.DOM.IteratorBinding extends Batman.DOM.AbstractCollectionBinding
       # Update the action number map to now reflect this new action which will go on the end of the queue.
       @actionMap.set item, options.actionNumber
       @actions[options.actionNumber] = ->
-        show = Batman.data node, 'show'
-        if typeof show is 'function'
-          show.call node, before: @siblingNode
+        if options.fragment
+          @fragment.appendChild node
         else
-          if options.fragment
-            @fragment.appendChild node
-          else
-            $insertBefore @parentNode(), node, @siblingNode
+          $insertBefore @parentNode(), node, @siblingNode
 
         if addItem = node.getAttribute 'data-additem'
           [_, context] = @renderer.context.findKey addItem
